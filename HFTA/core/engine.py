@@ -49,14 +49,21 @@ class Engine:
         )
 
     def run_forever(self) -> None:
-        while True:
-            for sym in self.symbols:
-                quote = self.client.get_quote(sym)
-                logger.debug("Quote: %s", quote)
+        """
+        Main loop. Gracefully stops on KeyboardInterrupt (Ctrl+C).
+        """
+        logger.info("Engine loop starting (live=%s)", self.live)
+        try:
+            while True:
+                for sym in self.symbols:
+                    quote = self.client.get_quote(sym)
+                    logger.debug("Quote: %s", quote)
 
-                for strat in self.strategies:
-                    intents = strat.on_quote(quote)
-                    for oi in intents:
-                        self._handle_order(oi)
+                    for strat in self.strategies:
+                        intents = strat.on_quote(quote)
+                        for oi in intents:
+                            self._handle_order(oi)
 
-            time.sleep(self.poll_interval)
+                time.sleep(self.poll_interval)
+        except KeyboardInterrupt:
+            logger.info("Engine stopped by user (KeyboardInterrupt).")

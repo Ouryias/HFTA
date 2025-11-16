@@ -54,6 +54,8 @@ def _to_float(val: Any) -> Optional[float]:
 class WealthsimpleClient:
     """
     Thin wrapper around WealthsimpleV2 for the HFTA engine.
+    - Ensures login (using interactive login if no session)
+    - Provides quotes, portfolio snapshot, and basic equity orders
     """
 
     def __init__(
@@ -62,11 +64,36 @@ class WealthsimpleClient:
         currency: str = "CAD",
         ws: Optional[WealthsimpleV2] = None,
     ) -> None:
+        # Underlying API client (loads tokens from keyring/env if available)
         self.ws = ws or WealthsimpleV2()
         self.currency = currency
         self._security_cache: Dict[str, str] = {}
+
+        # Ensure session is initialized (similar to interactive_trade.py)
+        self._ensure_login()
+
+        # Only after login can we safely query accounts
         self._account_id = account_id or self._auto_pick_default_account()
         logger.info("WealthsimpleClient initialized for account %s", self._account_id)
+
+    # ------------------------------------------------------------------ #
+    # Login handling
+    # ------------------------------------------------------------------ #
+
+    def _ensure_login(self) -> None:
+        """
+        If the WealthsimpleV2 client is not initialized, trigger interactive login.
+        This mirrors the pattern from interactive_trade.py.
+        """
+        initialized = getattr(self.ws, "initialized", False)
+        if initialized:
+            logger.info("Wealthsimple session already initialized.")
+            return
+
+        print("No active Wealthsimple session found. Please log in.")
+        # wealthsimple_v2.WealthsimpleV2 defines an interactive login() method
+        self.ws.login()
+        logger.info("Wealthsimple login completed.")
 
     # ------------------------------------------------------------------ #
     # Account helpers

@@ -40,4 +40,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # In case anything escapes the engine-level handler
+        print("\nStopped by user.")
