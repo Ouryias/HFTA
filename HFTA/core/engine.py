@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import List, Optional
+from typing import List, Optional, Mapping, Any
 
 from HFTA.broker.client import WealthsimpleClient, PortfolioSnapshot
 from HFTA.core.order_manager import OrderManager
@@ -23,6 +23,9 @@ class Engine:
     If `paper_cash` is set and OrderManager.live is False, the engine
     simulates a paper account with that cash amount, regardless of the
     real Wealthsimple cash balance.
+
+    In DRY-RUN mode, risk checks are done against the paper positions
+    maintained by ExecutionTracker, not against live WS holdings.
     """
 
     def __init__(
@@ -60,6 +63,18 @@ class Engine:
             cash_available=self.paper_cash,
         )
 
+    def _positions_for_risk(self, ws_positions: Mapping[str, Any]) -> Mapping[str, Any]:
+        """
+        Decide which positions snapshot to pass into RiskManager:
+
+        - live mode: use actual Wealthsimple positions
+        - DRY-RUN: use ExecutionTracker positions (paper positions)
+        """
+        tracker = getattr(self.order_manager, "execution_tracker", None)
+        if self.order_manager.live or tracker is None:
+            return ws_positions
+        return tracker.summary()
+
     # ------------------------------------------------------------------ #
     # Main loop
     # ------------------------------------------------------------------ #
@@ -77,15 +92,17 @@ class Engine:
             while True:
                 # Real snapshot + current holdings from Wealthsimple
                 real_snapshot = self.client.get_portfolio_snapshot()
-                positions = self.client.get_equity_positions()
+                ws_positions = self.client.get_equity_positions()
 
-                # Seed execution tracker from holdings once
                 tracker = getattr(self.order_manager, "execution_tracker", None)
                 if tracker is not None:
-                    tracker.seed_from_positions(positions)
+                    # Seed tracker once from live holdings
+                    tracker.seed_from_positions(ws_positions)
 
-                # Snapshot actually used for risk checks (may be paper-cash)
+                # Snapshot actually used for risk (may be paper-cash)
                 snapshot = self._make_sim_snapshot(real_snapshot)
+                # Positions actually used for risk (paper vs live)
+                positions_for_risk = self._positions_for_risk(ws_positions)
 
                 for sym in self.symbols:
                     quote = self.client.get_quote(sym)
@@ -94,9 +111,11 @@ class Engine:
                     for strat in self.strategies:
                         intents = strat.on_quote(quote)
                         for oi in intents:
-                            self.order_manager.process_order(oi, quote, snapshot, positions)
+                            self.order_manager.process_order(
+                                oi, quote, snapshot, positions_for_risk
+                            )
 
-                # Engine-level PnL summary
+                # Engine-level PnL summary (paper positions)
                 if tracker is not None:
                     tracker.log_summary()
 

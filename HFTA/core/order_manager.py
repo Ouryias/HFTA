@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, Mapping
 
-from HFTA.broker.client import WealthsimpleClient, Quote, PortfolioSnapshot, Holding
+from HFTA.broker.client import WealthsimpleClient, Quote, PortfolioSnapshot
 from HFTA.core.execution_tracker import ExecutionTracker
 from HFTA.core.risk_manager import RiskManager
 from HFTA.strategies.base import OrderIntent
@@ -65,7 +65,7 @@ class OrderManager:
         oi: OrderIntent,
         quote: Quote,
         snapshot: PortfolioSnapshot,
-        positions: Dict[str, Holding],
+        positions: Mapping[str, Any],
     ) -> None:
         if not self.risk_manager.approve(oi, quote, snapshot, positions):
             logger.info("Order blocked by risk: %s", oi)
