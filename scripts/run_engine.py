@@ -43,5 +43,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        # In case anything escapes the engine-level handler
+        # Extra safety in case anything escapes the engine-level handler
         print("\nStopped by user.")

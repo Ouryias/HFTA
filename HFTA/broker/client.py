@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import getpass
+
 from HFTA.wealthsimple_v2 import WealthsimpleV2
 
 logger = logging.getLogger(__name__)
@@ -54,8 +56,11 @@ def _to_float(val: Any) -> Optional[float]:
 class WealthsimpleClient:
     """
     Thin wrapper around WealthsimpleV2 for the HFTA engine.
-    - Ensures login (using interactive login if no session)
-    - Provides quotes, portfolio snapshot, and basic equity orders
+
+    Responsibilities:
+    - Ensure we are logged in (reusing keyring/env tokens if available,
+      otherwise prompting once for credentials and calling authenticate()).
+    - Provide quotes, portfolio snapshot, and basic equity orders.
     """
 
     def __init__(
@@ -64,15 +69,15 @@ class WealthsimpleClient:
         currency: str = "CAD",
         ws: Optional[WealthsimpleV2] = None,
     ) -> None:
-        # Underlying API client (loads tokens from keyring/env if available)
+        # Underlying API client (its __init__ already tries keyring/env creds)
         self.ws = ws or WealthsimpleV2()
         self.currency = currency
         self._security_cache: Dict[str, str] = {}
 
-        # Ensure session is initialized (similar to interactive_trade.py)
+        # Make sure we actually have an access token; if not, prompt user
         self._ensure_login()
 
-        # Only after login can we safely query accounts
+        # After login we can safely fetch accounts
         self._account_id = account_id or self._auto_pick_default_account()
         logger.info("WealthsimpleClient initialized for account %s", self._account_id)
 
@@ -82,18 +87,34 @@ class WealthsimpleClient:
 
     def _ensure_login(self) -> None:
         """
-        If the WealthsimpleV2 client is not initialized, trigger interactive login.
-        This mirrors the pattern from interactive_trade.py.
+        If the WealthsimpleV2 client has no access_token, do an interactive login:
+
+        1. Check if self.ws.access_token is already set (from keyring/env).
+        2. If not, prompt for username/password/otp and call authenticate().
+        3. Save tokens to keyring using _save_tokens_to_keyring() if available.
         """
-        initialized = getattr(self.ws, "initialized", False)
-        if initialized:
-            logger.info("Wealthsimple session already initialized.")
+        if getattr(self.ws, "access_token", None):
+            logger.info("Wealthsimple session already authenticated.")
             return
 
         print("No active Wealthsimple session found. Please log in.")
-        # wealthsimple_v2.WealthsimpleV2 defines an interactive login() method
-        self.ws.login()
-        logger.info("Wealthsimple login completed.")
+
+        username = input("Wealthsimple email/username: ").strip()
+        password = getpass.getpass("Wealthsimple password: ").strip()
+        otp = input("OTP (press Enter if not required): ").strip() or None
+
+        # Authenticate via wealthsimple_v2.authenticate(...)
+        self.ws.authenticate(username, password, otp)
+
+        # Persist tokens to keyring if method is available
+        save_fn = getattr(self.ws, "_save_tokens_to_keyring", None)
+        if callable(save_fn):
+            try:
+                save_fn(username=username)
+            except Exception as e:
+                logger.warning("Failed to save tokens to keyring: %s", e)
+
+        logger.info("Wealthsimple login successful.")
 
     # ------------------------------------------------------------------ #
     # Account helpers
@@ -103,10 +124,13 @@ class WealthsimpleClient:
         accounts = self.ws.get_accounts()
         if not accounts:
             raise RuntimeError("No accounts returned from Wealthsimple API.")
+
+        # Pick the first OPEN account if possible
         for acc in accounts:
-            # Adjust key names if needed based on actual structure
             if acc.get("status") == "OPEN":
                 return acc["id"]
+
+        # Fallback: first account
         return accounts[0]["id"]
 
     @property
