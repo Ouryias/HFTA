@@ -19,11 +19,11 @@ class AIController:
     ChatGPT-based controller that periodically:
       - Observes current PnL, positions, strategy & risk params.
       - Asks a GPT model for JSON suggestions.
-      - Applies safe numeric tweaks live to strategies & risk config.
-      - Logs any code/logic-change ideas for you to review manually.
+      - Applies safe numeric tweaks to strategies & risk config.
+      - Logs a detailed assessment / recommendations for you.
 
-    It is intentionally conservative: it only changes attributes that
-    already exist and are numeric, and it clamps changes to a sane range.
+    It only tweaks numeric fields which already exist on the objects,
+    and clamps changes to avoid huge jumps.
     """
 
     def __init__(
@@ -59,7 +59,24 @@ class AIController:
         self._loop_counter = 0
 
     # ------------------------------------------------------------------ #
-    # Public entry point from Engine
+    # Backwards-compatible entry point from Engine
+    # ------------------------------------------------------------------ #
+
+    def on_loop(
+        self,
+        risk_config: Any,
+        strategies: List[Any],
+        execution_tracker: Any,
+    ) -> None:
+        """
+        Backwards-compatible method expected by Engine.run_forever().
+
+        Delegates to maybe_run(...) which contains the actual logic.
+        """
+        self.maybe_run(risk_config, strategies, execution_tracker)
+
+    # ------------------------------------------------------------------ #
+    # Main periodic hook
     # ------------------------------------------------------------------ #
 
     def maybe_run(
@@ -85,7 +102,9 @@ class AIController:
             return
 
         try:
-            state_json = self._build_state_json(risk_config, strategies, execution_tracker)
+            state_json = self._build_state_json(
+                risk_config, strategies, execution_tracker
+            )
             logger.debug("AIController state JSON: %s", state_json)
 
             response = self._call_model(state_json)
@@ -115,14 +134,11 @@ class AIController:
         """
         state: Dict[str, Any] = {}
 
-        # Realized PnL
+        # Realized PnL & positions
         realized_pnl_total = 0.0
         positions_dict: Dict[str, Any] = {}
 
         try:
-            # Assume execution_tracker has attributes:
-            #   positions: dict[symbol] -> position_obj
-            #   realized_pnl_per_symbol: optional dict
             positions = getattr(execution_tracker, "positions", {})
             realized_per_symbol = getattr(
                 execution_tracker, "realized_pnl_per_symbol", {}
@@ -149,18 +165,21 @@ class AIController:
         state["realized_pnl_total"] = realized_pnl_total
         state["positions"] = positions_dict
 
-        # Risk config: whitelist simple numeric fields
+        # Risk config: whitelist simple numeric/bool fields
         risk_info: Dict[str, Any] = {}
-        for key in ("max_notional_per_order", "max_cash_utilization", "allow_short_selling"):
+        for key in (
+            "max_notional_per_order",
+            "max_cash_utilization",
+            "allow_short_selling",
+        ):
             if hasattr(risk_config, key):
                 val = getattr(risk_config, key)
-                # Allow bool for allow_short_selling
                 if isinstance(val, (int, float, bool)):
                     risk_info[key] = val
 
         state["risk"] = risk_info
 
-        # Strategies: capture a few key numeric parameters
+        # Strategies: capture key numeric parameters
         strat_list: List[Dict[str, Any]] = []
         for strat in strategies:
             strat_info: Dict[str, Any] = {}
@@ -169,7 +188,6 @@ class AIController:
             strat_info["name"] = name
             strat_info["type"] = stype
 
-            # Generic numeric fields we care about if present
             numeric_fields = [
                 "spread",
                 "max_inventory",
@@ -212,31 +230,41 @@ class AIController:
             "max_notional_per_order": 2000,
             "max_cash_utilization": 0.15
           },
-          "code_change_ideas": "text..."
+          "overall_assessment": "text...",
+          "detailed_recommendations": {
+            "risk": "text...",
+            "strategies": "text...",
+            "operations": "text..."
+          }
         }
         """
         if self.client is None:
             raise RuntimeError("AIController client not initialized")
 
         system_prompt = (
-            "You are a cautious trading-parameter assistant."
+            "You are a cautious but proactive trading-parameter assistant. "
+            "You tune a small intraday / HFT-like strategy suite that is "
+            "currently running with *paper* capital. You must preserve "
+            "risk control while trying to improve risk-adjusted returns."
         )
 
         user_prompt = (
-            "You are an AI trading-parameter tuner for a small HFT-like "
-            "system running in paper trading mode.\n"
             "You will receive the current state (PnL, positions, risk "
             "config, strategy parameters) as JSON.\n\n"
             "Goals:\n"
             "1) Improve expected risk-adjusted returns while keeping risk reasonable.\n"
             "2) Only propose small, incremental changes to numeric parameters.\n"
             "3) NEVER enable short selling (keep allow_short_selling=false).\n"
-            "4) If you have ideas for code or logic changes that go beyond\n"
-            "   parameter tweaks, describe them in text.\n\n"
+            "4) Return a comprehensive but concise assessment of the current setup.\n\n"
             "Return a single JSON object with keys:\n"
-            "- strategy_updates: list of {name, params} with numeric values.\n"
-            "- risk_updates: object with optional numeric fields.\n"
-            "- code_change_ideas: short markdown text with any deeper ideas.\n"
+            "- strategy_updates: list of {name, params} where params is an object "
+            "  of numeric changes (e.g. spread, windows, thresholds).\n"
+            "- risk_updates: object with optional numeric fields "
+            "  (e.g. max_notional_per_order, max_cash_utilization).\n"
+            "- overall_assessment: a short paragraph summarizing performance, "
+            "  risk, and any major issues.\n"
+            "- detailed_recommendations: an object with keys 'risk', 'strategies', "
+            "  and 'operations', each a short markdown string with concrete advice.\n"
         )
 
         messages = [
@@ -245,8 +273,7 @@ class AIController:
             {"role": "user", "content": f"Current state JSON:\n{state_json}"},
         ]
 
-        # NOTE: For gpt-5-mini and similar models, we must use
-        #       max_completion_tokens instead of max_tokens.
+        # For gpt-5-mini and other newer models, use max_completion_tokens.
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -255,7 +282,6 @@ class AIController:
             response_format={"type": "json_object"},
         )
 
-        # OpenAI client v1.x: resp.choices[0].message.content
         content = resp.choices[0].message.content
         if not content:
             raise RuntimeError("AIController: empty content in model response")
@@ -269,7 +295,8 @@ class AIController:
 
         if not isinstance(parsed, dict):
             raise RuntimeError(
-                f"AIController: model JSON must be an object, got: {type(parsed)}"
+                "AIController: model JSON must be an object, got: "
+                f"{type(parsed)}"
             )
 
         return parsed
@@ -285,11 +312,28 @@ class AIController:
         strategies: List[Any],
     ) -> None:
         """
-        Apply strategy_updates and risk_updates to in-memory objects.
+        Apply strategy_updates and risk_updates to in-memory objects and
+        log the assessment/recommendations.
         """
         strategy_updates = response.get("strategy_updates") or []
         risk_updates = response.get("risk_updates") or {}
+        overall_assessment = response.get("overall_assessment")
+        detailed_recs = response.get("detailed_recommendations") or {}
         code_ideas = response.get("code_change_ideas")
+
+        if overall_assessment:
+            logger.info("AI overall assessment:\n%s", overall_assessment)
+
+        if isinstance(detailed_recs, Mapping):
+            risk_text = detailed_recs.get("risk")
+            strat_text = detailed_recs.get("strategies")
+            ops_text = detailed_recs.get("operations")
+            if risk_text:
+                logger.info("AI recommendations (risk):\n%s", risk_text)
+            if strat_text:
+                logger.info("AI recommendations (strategies):\n%s", strat_text)
+            if ops_text:
+                logger.info("AI recommendations (operations):\n%s", ops_text)
 
         if code_ideas:
             logger.info("AI suggested code/logic ideas:\n%s", code_ideas)
@@ -310,7 +354,6 @@ class AIController:
         """
         For each update:
           {"name": "mm_AAPL", "params": {"spread": 0.06, "max_inventory": 3}}
-
         find the matching strategy by .name and apply numeric changes.
         """
         strategies_by_name: Dict[Optional[str], Any] = {
@@ -405,14 +448,16 @@ class AIController:
                 )
                 continue
 
-            # Convert bool to float for clamping
+            # Bool field (e.g. allow_short_selling)
             if isinstance(old, bool):
-                setattr(risk_config, key, bool(val))
+                new_val = bool(val)
+                setattr(risk_config, key, new_val)
                 logger.info(
-                    "AI updated risk_config bool: %s %r -> %r", key, old, bool(val)
+                    "AI updated risk_config bool: %s %r -> %r", key, old, new_val
                 )
                 continue
 
+            # Numeric field
             val = float(val)
 
             # Clamp magnitude
