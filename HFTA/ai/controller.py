@@ -17,13 +17,13 @@ logger = logging.getLogger(__name__)
 class AIController:
     """
     ChatGPT-based controller that periodically:
-      - Observes current PnL, positions, strategy & risk params.
-      - Asks a GPT model for JSON suggestions.
-      - Applies safe numeric tweaks to strategies & risk config.
-      - Logs a detailed assessment / recommendations for you.
 
-    It only tweaks numeric fields which already exist on the objects,
-    and clamps changes to avoid huge jumps.
+      - Observes current PnL, positions, risk config, and strategy params.
+      - Calls a GPT model (e.g. gpt-5-mini) for JSON suggestions.
+      - Applies small, safe tweaks to numeric parameters.
+      - Logs a textual assessment and recommendations.
+
+    It never enables short selling and clamps the size of any numeric change.
     """
 
     def __init__(
@@ -39,6 +39,8 @@ class AIController:
         self.temperature = float(temperature)
         self.max_output_tokens = int(max_output_tokens)
         self.enabled = bool(enabled) and OpenAI is not None
+
+        self._loop_counter = 0
 
         if not self.enabled:
             if OpenAI is None:
@@ -56,24 +58,23 @@ class AIController:
                 self.interval_loops,
             )
 
-        self._loop_counter = 0
-
     # ------------------------------------------------------------------ #
-    # Backwards-compatible entry point from Engine
+    # Entry point from Engine
     # ------------------------------------------------------------------ #
 
     def on_loop(
         self,
         risk_config: Any,
         strategies: List[Any],
-        execution_tracker: Any,
+        tracker: Any,
     ) -> None:
         """
-        Backwards-compatible method expected by Engine.run_forever().
+        Method expected by Engine.run_forever().
 
-        Delegates to maybe_run(...) which contains the actual logic.
+        Engine passes tracker=<ExecutionTracker>. We just forward it
+        to maybe_run(...).
         """
-        self.maybe_run(risk_config, strategies, execution_tracker)
+        self.maybe_run(risk_config, strategies, tracker)
 
     # ------------------------------------------------------------------ #
     # Main periodic hook
@@ -89,8 +90,8 @@ class AIController:
         Called from the engine loop.
 
         Every `interval_loops` calls, this will:
-          - Build a JSON snapshot of current state (PnL, positions,
-            risk_config, strategies).
+
+          - Build a JSON snapshot of current state.
           - Call the model.
           - Apply updates to strategies and risk_config.
         """
@@ -127,6 +128,7 @@ class AIController:
     ) -> str:
         """
         Build a compact JSON string describing:
+
           - total realized PnL
           - per-symbol positions (quantity, avg_price, realized_pnl)
           - current risk_config (whitelisted fields)
@@ -134,7 +136,7 @@ class AIController:
         """
         state: Dict[str, Any] = {}
 
-        # Realized PnL & positions
+        # Positions & realized PnL
         realized_pnl_total = 0.0
         positions_dict: Dict[str, Any] = {}
 
@@ -165,7 +167,7 @@ class AIController:
         state["realized_pnl_total"] = realized_pnl_total
         state["positions"] = positions_dict
 
-        # Risk config: whitelist simple numeric/bool fields
+        # Risk config: allow only simple numeric/bool fields
         risk_info: Dict[str, Any] = {}
         for key in (
             "max_notional_per_order",
@@ -179,7 +181,7 @@ class AIController:
 
         state["risk"] = risk_info
 
-        # Strategies: capture key numeric parameters
+        # Strategies: capture main numeric parameters
         strat_list: List[Dict[str, Any]] = []
         for strat in strategies:
             strat_info: Dict[str, Any] = {}
@@ -243,9 +245,9 @@ class AIController:
 
         system_prompt = (
             "You are a cautious but proactive trading-parameter assistant. "
-            "You tune a small intraday / HFT-like strategy suite that is "
-            "currently running with *paper* capital. You must preserve "
-            "risk control while trying to improve risk-adjusted returns."
+            "You tune a small intraday / HFT-like system running on paper. "
+            "You must preserve risk control while trying to improve "
+            "risk-adjusted returns."
         )
 
         user_prompt = (
@@ -255,7 +257,7 @@ class AIController:
             "1) Improve expected risk-adjusted returns while keeping risk reasonable.\n"
             "2) Only propose small, incremental changes to numeric parameters.\n"
             "3) NEVER enable short selling (keep allow_short_selling=false).\n"
-            "4) Return a comprehensive but concise assessment of the current setup.\n\n"
+            "4) Return a concise but comprehensive assessment of the current setup.\n\n"
             "Return a single JSON object with keys:\n"
             "- strategy_updates: list of {name, params} where params is an object "
             "  of numeric changes (e.g. spread, windows, thresholds).\n"
@@ -273,7 +275,7 @@ class AIController:
             {"role": "user", "content": f"Current state JSON:\n{state_json}"},
         ]
 
-        # For gpt-5-mini and other newer models, use max_completion_tokens.
+        # For gpt-5-mini and other newer models we must use max_completion_tokens.
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -396,21 +398,21 @@ class AIController:
                     )
                     continue
 
-                val = float(val)
+                val_f = float(val)
 
-                # Clamp change magnitude: avoid huge jumps
+                # Clamp change magnitude to avoid huge jumps
                 if old != 0:
-                    ratio = abs(val / old)
+                    ratio = abs(val_f / old)
                     if ratio > 3.0:
-                        val = old * (3.0 if val > 0 else -3.0)
+                        val_f = old * (3.0 if val_f > 0 else -3.0)
 
-                setattr(strat, key, val)
+                setattr(strat, key, val_f)
                 logger.info(
                     "AI updated strategy %s: %s %.4f -> %.4f",
                     name,
                     key,
                     old,
-                    val,
+                    val_f,
                 )
 
     def _apply_risk_updates(
@@ -458,17 +460,17 @@ class AIController:
                 continue
 
             # Numeric field
-            val = float(val)
+            val_f = float(val)
 
             # Clamp magnitude
             if old != 0:
-                ratio = abs(val / old)
+                ratio = abs(val_f / old)
                 if ratio > 2.0:
-                    val = old * (2.0 if val > 0 else -2.0)
+                    val_f = old * (2.0 if val_f > 0 else -2.0)
 
-            setattr(risk_config, key, val)
+            setattr(risk_config, key, val_f)
             logger.info(
-                "AI updated risk_config: %s %.4f -> %.4f", key, old, val
+                "AI updated risk_config: %s %.4f -> %.4f", key, old, val_f
             )
 
         # Never allow shorts even if model suggests it
