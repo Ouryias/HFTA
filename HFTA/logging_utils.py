@@ -14,6 +14,7 @@ def parse_log_level(level_str: str) -> int:
     """
     if not level_str:
         return logging.DEBUG
+
     level_str = level_str.upper()
     return {
         "CRITICAL": logging.CRITICAL,
@@ -29,14 +30,17 @@ def setup_logging(
     name: str,
     log_file: Optional[str] = None,
     level: int = logging.DEBUG,
+    log_to_console: bool = False,
 ) -> logging.Logger:
     """
-    Configure and return a logger that logs to both stdout and (optionally) a file.
+    Configure and return a logger.
 
-    - name: logger name, e.g. "HFTA.backtest"
+    - name: logger name, e.g. "HFTA.engine"
     - log_file: path to log file (directories are created automatically)
     - level: logging level (DEBUG by default)
+    - log_to_console: if True, also log to stdout; if False, log only to file
     """
+
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.propagate = False  # avoid double logging via root
@@ -51,11 +55,12 @@ def setup_logging(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    console_handler.setFormatter(fmt)
-    logger.addHandler(console_handler)
+    # Optional console handler
+    if log_to_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(fmt)
+        logger.addHandler(console_handler)
 
     # Optional file handler
     if log_file:
