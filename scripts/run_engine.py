@@ -84,10 +84,8 @@ def build_strategies(cfg: Dict[str, Any]) -> List[Any]:
             raise ValueError(f"Unknown strategy type: {s_type}")
 
         try:
-            # Original style used throughout the project
             strat = cls(name=s_name, config=s_conf)
         except TypeError:
-            # Fallback if a strategy class later switches to explicit kwargs
             strat = cls(name=s_name, **s_conf)
 
         strategies.append(strat)
@@ -179,7 +177,6 @@ def main() -> None:
             client=client,
             strategies=strategies,
             order_manager=order_manager,
-            execution_tracker=execution_tracker,
             ai_controller=ai_controller,
             poll_interval=poll_interval,
             paper_cash=paper_cash,
