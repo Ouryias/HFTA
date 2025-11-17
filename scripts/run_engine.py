@@ -117,7 +117,12 @@ def main() -> None:
     args = parser.parse_args()
 
     level = parse_log_level(args.log_level)
-    logger = setup_logging("HFTA.engine", args.log_file, level)
+    logger = setup_logging(
+        "HFTA.engine",
+        log_file=args.log_file,
+        level=level,
+        log_to_console=True, 
+    )
     logger.debug("Parsed arguments: %s", vars(args))
     logger.info("Starting run_engine with config=%s", args.config)
 
