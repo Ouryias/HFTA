@@ -7,7 +7,6 @@
     "max_notional_per_order": 200.0,
     "max_cash_utilization": 0.1,
     "allow_short_selling": false,
-
     "max_total_exposure_ratio": 1.5,
     "max_positions": 10
   },
@@ -15,7 +14,6 @@
   "data": {
     "quote_source": "yfinance",
     "max_workers": 4,
-    "finnhub_api_key": "",
     "finnhub_max_calls_per_minute": 60,
     "finnhub_rate_limit_cooldown": 60.0
   },
