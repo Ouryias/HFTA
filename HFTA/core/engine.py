@@ -10,6 +10,7 @@ from HFTA.strategies.base import Strategy
 from HFTA.market.quote_provider import BaseQuoteProvider
 from HFTA.market.intraday_stats import IntradayStatsTracker
 from HFTA.symbol_selection import SymbolSelector
+from HFTA.market.quote_recorder import record_quote
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,11 @@ class Engine:
                         logger.debug("Engine loop %d: missing quote for %s; skipping.", loop_idx, sym)
                         continue
                     logger.debug("Quote: %s", quote)
+
+                    try:
+                        record_quote(sym, quote, source="wealthsimple")
+                    except Exception:
+                        logger.exception("Failed to record quote for %s", sym)
                     # Update intraday stats
                     if self.intraday_stats is not None:
                         price: Optional[float] = quote.last
