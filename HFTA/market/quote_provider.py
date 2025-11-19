@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import yfinance as yf  # type: ignore
-except Exception:  # yfinance is optional
+except Exception:  # pragma: no cover - optional dependency
     yf = None  # type: ignore
 
 
@@ -87,13 +87,11 @@ class WealthsimpleQuoteProvider(BaseQuoteProvider):
 
 
 class FinnhubQuoteProvider(BaseQuoteProvider):
-    """Production-oriented quote provider using Finnhub's official API.
+    """Quote provider using Finnhub's official API.
 
     - Uses /quote endpoint for near real-time prices.
     - Supports parallel fetch for multiple symbols, but enforces a per-minute
       call budget to avoid 429 Too Many Requests.
-    - Suitable for live trading as long as you configure your rate limits
-      according to your Finnhub plan.
 
     API key resolution order:
       1) Explicit api_key argument
@@ -284,69 +282,23 @@ class FinnhubQuoteProvider(BaseQuoteProvider):
 
 
 class YFinanceQuoteProvider(BaseQuoteProvider):
-    """Quote provider using yfinance (Yahoo Finance).
+    """Quote provider using yfinance (Yahoo Finance) in a batched fashion.
 
-    This is convenient for development and DRY-RUN, but it is not a
-    guaranteed low-latency production feed. It makes one HTTP call per
-    symbol, optionally in parallel.
+    For multiple symbols, we call `yf.download` once with all tickers and
+    use the latest 1-minute close for each symbol. This is suitable for
+    development / DRY-RUN intraday testing but is not a low-latency
+    production data feed.
 
     Requirements:
       - pip install yfinance
     """
 
-    def __init__(self, max_workers: int = 4) -> None:
+    def __init__(self) -> None:
         if yf is None:
             raise RuntimeError(
                 "YFinanceQuoteProvider: yfinance is not installed. "
                 "Install with: pip install yfinance"
             )
-        self.max_workers = max_workers
-
-    def _fetch_one(self, symbol: str) -> Optional[Quote]:
-        sym = symbol.upper()
-        try:
-            t = yf.Ticker(sym)
-
-            last = None
-            # Try fast_info first (cheap)
-            try:
-                fast = t.fast_info
-                # fast_info can be dict-like or object-like depending on version
-                if isinstance(fast, dict):
-                    last = fast.get("last_price") or fast.get("regular_market_price")
-                else:
-                    last = getattr(fast, "last_price", None) or getattr(
-                        fast, "regular_market_price", None
-                    )
-            except Exception:
-                last = None
-
-            if last is None:
-                # Fallback: use most recent 1-minute close from today
-                hist = t.history(period="1d", interval="1m")
-                if hist.empty:
-                    logger.debug(
-                        "YFinanceQuoteProvider: empty history for %s", sym
-                    )
-                    return None
-                last = float(hist["Close"].iloc[-1])
-
-            last_f = float(last)
-            now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-
-            return Quote(
-                symbol=sym,
-                security_id=sym,
-                bid=last_f,
-                ask=last_f,
-                last=last_f,
-                bid_size=None,
-                ask_size=None,
-                timestamp=now_iso,
-            )
-        except Exception:
-            logger.exception("YFinanceQuoteProvider: failed to fetch quote for %s", sym)
-            return None
 
     def get_quotes(self, symbols: List[str]) -> Dict[str, Quote]:
         symbols = [s.upper() for s in symbols]
@@ -355,27 +307,130 @@ class YFinanceQuoteProvider(BaseQuoteProvider):
         if not symbols:
             return quotes
 
-        # Single-threaded fast path
-        if len(symbols) == 1 or self.max_workers <= 1:
-            for sym in symbols:
-                q = self._fetch_one(sym)
-                if q is not None:
-                    quotes[sym] = q
+        # Import pandas lazily (yfinance depends on it)
+        try:
+            import pandas as pd  # type: ignore
+        except Exception:
+            logger.error(
+                "YFinanceQuoteProvider: pandas is required but not available."
+            )
             return quotes
 
-        # Parallel fetch for multiple symbols
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            fut_to_sym = {executor.submit(self._fetch_one, sym): sym for sym in symbols}
-            for fut in as_completed(fut_to_sym):
-                sym = fut_to_sym[fut]
-                try:
-                    q = fut.result()
-                except Exception:
-                    logger.exception(
-                        "YFinanceQuoteProvider: error fetching %s", sym
-                    )
+        # Single-symbol fast path
+        if len(symbols) == 1:
+            sym = symbols[0]
+            try:
+                data = yf.download(
+                    tickers=sym,
+                    period="1d",
+                    interval="1m",
+                    auto_adjust=False,
+                    progress=False,
+                    group_by="ticker",
+                    threads=False,
+                )
+            except Exception:
+                logger.exception(
+                    "YFinanceQuoteProvider: download failed for %s", sym
+                )
+                return quotes
+
+            if data is None or data.empty:
+                return quotes
+
+            closes = data.get("Close")
+            if closes is None or closes.dropna().empty:
+                return quotes
+
+            last = float(closes.dropna().iloc[-1])
+            ts = closes.index[-1].to_pydatetime().isoformat()
+
+            quotes[sym] = Quote(
+                symbol=sym,
+                security_id=sym,
+                bid=last,
+                ask=last,
+                last=last,
+                bid_size=None,
+                ask_size=None,
+                timestamp=ts,
+            )
+            return quotes
+
+        # Multi-symbol: single batch download
+        tickers_str = " ".join(symbols)
+        try:
+            data = yf.download(
+                tickers=tickers_str,
+                period="1d",
+                interval="1m",
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+            )
+        except Exception:
+            logger.exception(
+                "YFinanceQuoteProvider: batch download failed for %s", symbols
+            )
+            return quotes
+
+        if data is None or data.empty:
+            return quotes
+
+        # When multiple tickers are requested, yfinance returns a DataFrame
+        # with a MultiIndex on columns: (field, ticker) or (ticker, field)
+        # depending on version. We handle both.
+        if isinstance(data.columns, pd.MultiIndex):
+            # Normalize to (ticker, field)
+            level0 = [str(x) for x in data.columns.levels[0]]
+            level1 = [str(x) for x in data.columns.levels[1]]
+
+            fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+            if any(f in level0 for f in fields) and not any(
+                f in level1 for f in fields
+            ):
+                # Columns like ('Close', 'AAPL') -> swap levels
+                df = data.copy()
+                df.columns = df.columns.swaplevel(0, 1)
+            else:
+                df = data
+
+            for sym in symbols:
+                if sym not in df.columns.levels[0]:
                     continue
-                if q is not None:
-                    quotes[sym] = q
+                sub = df[sym]
+                closes = sub.get("Close")
+                if closes is None or closes.dropna().empty:
+                    continue
+                last = float(closes.dropna().iloc[-1])
+                ts = closes.index[-1].to_pydatetime().isoformat()
+                quotes[sym] = Quote(
+                    symbol=sym,
+                    security_id=sym,
+                    bid=last,
+                    ask=last,
+                    last=last,
+                    bid_size=None,
+                    ask_size=None,
+                    timestamp=ts,
+                )
+        else:
+            # Fallback: assume data corresponds to the first symbol
+            closes = data.get("Close")
+            if closes is not None and not closes.dropna().empty:
+                last = float(closes.dropna().iloc[-1])
+                ts = closes.index[-1].to_pydatetime().isoformat()
+                sym = symbols[0]
+                quotes[sym] = Quote(
+                    symbol=sym,
+                    security_id=sym,
+                    bid=last,
+                    ask=last,
+                    last=last,
+                    bid_size=None,
+                    ask_size=None,
+                    timestamp=ts,
+                )
 
         return quotes

@@ -10,20 +10,21 @@ from HFTA.broker.client import WealthsimpleClient, PortfolioSnapshot, Quote
 from HFTA.core.order_manager import OrderManager
 from HFTA.strategies.base import Strategy
 from HFTA.market.quote_provider import BaseQuoteProvider
+from HFTA.market.intraday_stats import IntradayStatsTracker
+from HFTA.symbol_selection import SymbolSelector
 
 logger = logging.getLogger(__name__)
 
 
 class Engine:
-    """Main polling loop for the HFTA system.
+    """Main event loop for strategy execution.
 
     Responsibilities:
-      - Pull portfolio snapshot and holdings from Wealthsimple.
-      - Fetch market quotes from a pluggable quote provider
-        (Wealthsimple, Finnhub, etc.).
-      - Run all strategies on each quote.
+      - Pull portfolio snapshot and positions from broker.
+      - Fetch all required quotes via the configured quote provider.
+      - Dispatch quotes to all strategies and collect OrderIntents.
       - Route resulting OrderIntents through the OrderManager.
-      - Optionally run the AI controller each loop for parameter/risk tuning.
+      - Optionally run the AI controller and dynamic symbol picker each loop.
 
     In DRY-RUN mode (live=False with paper_cash set), the portfolio snapshot
     is overridden with the configured paper_cash while still using the real
@@ -40,6 +41,8 @@ class Engine:
         poll_interval: float = 2.0,
         paper_cash: Optional[float] = None,
         ai_controller: Optional[Any] = None,
+        intraday_stats: Optional[IntradayStatsTracker] = None,
+        symbol_selector: Optional[SymbolSelector] = None,
     ) -> None:
         self.client = client
         self.strategies = strategies
@@ -49,6 +52,8 @@ class Engine:
         self.poll_interval = poll_interval
         self.paper_cash = paper_cash
         self.ai_controller = ai_controller
+        self.intraday_stats = intraday_stats
+        self.symbol_selector = symbol_selector
 
     # ------------------------------------------------------------------ #
     # DRY-RUN snapshot helpers
@@ -82,16 +87,22 @@ class Engine:
         return tracker.summary()
 
     # ------------------------------------------------------------------ #
-    # Main engine loop
+    # Main loop
     # ------------------------------------------------------------------ #
 
     def run_forever(self) -> None:
+        """Run the engine loop until interrupted.
+
+        This method blocks in an infinite loop and should typically be run
+        from a script entrypoint (see scripts/run_engine.py).
+        """
+        loop_idx = 0
         logger.info(
             "Engine loop starting (live=%s, paper_cash=%s)",
             self.order_manager.live,
             self.paper_cash,
         )
-        loop_idx = 0
+
         try:
             while True:
                 loop_idx += 1
@@ -119,7 +130,7 @@ class Engine:
                         self.symbols,
                     )
 
-                # 3) Run strategies on each quote
+                # 3) Run strategies on each quote (and update intraday stats)
                 for sym in self.symbols:
                     quote = quotes_by_symbol.get(sym)
                     if quote is None:
@@ -131,6 +142,19 @@ class Engine:
                         continue
 
                     logger.debug("Quote: %s", quote)
+
+                    # Feed intraday stats tracker, if enabled
+                    if self.intraday_stats is not None:
+                        price: Optional[float] = quote.last
+                        if price is None:
+                            if quote.bid is not None and quote.ask is not None:
+                                price = (quote.bid + quote.ask) / 2.0
+                            elif quote.bid is not None:
+                                price = quote.bid
+                            elif quote.ask is not None:
+                                price = quote.ask
+                        if price is not None:
+                            self.intraday_stats.on_quote(sym, price)
 
                     for strat in self.strategies:
                         intents = strat.on_quote(quote)
@@ -149,6 +173,17 @@ class Engine:
                         )
                     except Exception:
                         logger.exception("AIController.on_loop failed")
+
+                # 5) Dynamic symbol selector (market-wide picker)
+                if self.symbol_selector is not None:
+                    try:
+                        self.symbol_selector.on_loop(
+                            strategies=self.strategies,
+                            tracker=tracker,
+                            intraday_stats=self.intraday_stats,
+                        )
+                    except Exception:
+                        logger.exception("SymbolSelector.on_loop failed")
 
                 if tracker is not None:
                     tracker.log_summary()

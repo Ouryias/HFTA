@@ -41,6 +41,14 @@
     }
   ],
 
+  "symbol_selector": {
+    "enabled": true,
+    "interval_loops": 12,
+    "min_trades": 3,
+    "mode": "hybrid",
+    "model": "gpt-5-mini"
+  },
+
   "ai": {
     "enabled": true,
     "model": "gpt-5-mini",

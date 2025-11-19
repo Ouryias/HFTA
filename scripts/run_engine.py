@@ -25,6 +25,8 @@ from HFTA.market.universe import (
     MarketUniverseConfig,
     MarketUniverse,
 )
+from HFTA.market.intraday_stats import IntradayStatsTracker
+from HFTA.symbol_selection import SymbolSelector
 from HFTA.strategies.micro_market_maker import MicroMarketMaker
 from HFTA.strategies.micro_trend_scalper import MicroTrendScalper
 
@@ -201,16 +203,60 @@ def build_quote_provider(
         return provider
 
     if source == "yfinance":
-        logger.info(
-            "Using YFinanceQuoteProvider for quotes (max_workers=%d).", max_workers
-        )
-        provider = YFinanceQuoteProvider(max_workers=max_workers)
+        logger.info("Using YFinanceQuoteProvider for quotes (batched).")
+        provider = YFinanceQuoteProvider()
         return provider
 
     logger.info(
         "Using WealthsimpleQuoteProvider for quotes (max_workers=%d).", max_workers
     )
     return WealthsimpleQuoteProvider(client=client, max_workers=max_workers)
+
+
+def build_symbol_selector(
+    cfg: Dict[str, Any],
+    logger,
+    market_universe: Optional[MarketUniverse],
+) -> Optional[SymbolSelector]:
+    """Create SymbolSelector (dynamic symbol picker) if enabled in config.
+
+    Config block (optional):
+
+      "symbol_selector": {
+        "enabled": true,
+        "interval_loops": 60,
+        "min_trades": 3,
+        "mode": "hybrid",  // "heuristic" | "gpt" | "hybrid"
+        "model": "gpt-5-mini"
+      }
+    """
+    ss_cfg = cfg.get("symbol_selector", {})
+    enabled = bool(ss_cfg.get("enabled", False))
+    if not enabled:
+        logger.info("SymbolSelector disabled in config.")
+        return None
+
+    interval_loops = int(ss_cfg.get("interval_loops", 60))
+    min_trades = int(ss_cfg.get("min_trades", 3))
+    mode = ss_cfg.get("mode", "hybrid")
+    model = ss_cfg.get("model", "gpt-5-mini")
+
+    selector = SymbolSelector(
+        market_universe=market_universe,
+        interval_loops=interval_loops,
+        min_trades=min_trades,
+        enabled=True,
+        mode=mode,
+        model=model,
+    )
+
+    logger.info(
+        "SymbolSelector enabled: mode=%s, interval_loops=%d, min_trades=%d",
+        selector.mode,
+        selector.interval_loops,
+        selector.min_trades,
+    )
+    return selector
 
 
 def main() -> None:
@@ -295,10 +341,12 @@ def main() -> None:
         live=False,  # DRY-RUN; live mode comes later
     )
 
-    # 5) Strategies, AI controller, quote provider
+    # 5) Strategies, AI controller, quote provider, symbol selector
     strategies = build_strategies(cfg, logger)
     ai_controller = build_ai_controller(cfg, logger)
     quote_provider = build_quote_provider(cfg, logger, client, poll_interval)
+    symbol_selector = build_symbol_selector(cfg, logger, market_universe)
+    intraday_stats = IntradayStatsTracker() if symbol_selector is not None else None
 
     logger.info(
         "Built %d strategies for symbols=%s", len(strategies), symbols
@@ -313,6 +361,14 @@ def main() -> None:
     else:
         logger.info("AIController disabled.")
 
+    if symbol_selector is not None:
+        logger.info(
+            "SymbolSelector will run every %d loops.",
+            symbol_selector.interval_loops,
+        )
+    else:
+        logger.info("SymbolSelector disabled or not configured.")
+
     # 6) Engine
     engine = Engine(
         client=client,
@@ -323,6 +379,8 @@ def main() -> None:
         poll_interval=poll_interval,
         paper_cash=paper_cash,
         ai_controller=ai_controller,
+        intraday_stats=intraday_stats,
+        symbol_selector=symbol_selector,
     )
 
     logger.info(
