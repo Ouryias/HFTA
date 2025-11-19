@@ -1,27 +1,32 @@
 {
-  "paper_cash": 100000.0,
-  "poll_interval": 1.0,
-
   "symbols": ["AAPL"],
+  "paper_cash": 100000,
+  "poll_interval": 5,
+
+  "risk": {
+    "max_notional_per_order": 200.0,
+    "max_cash_utilization": 0.1,
+    "allow_short_selling": false,
+
+    "max_total_exposure_ratio": 1.5,
+    "max_positions": 10
+  },
+
+  "data": {
+    "quote_source": "yfinance",
+    "max_workers": 4,
+    "finnhub_api_key": "",
+    "finnhub_max_calls_per_minute": 60,
+    "finnhub_rate_limit_cooldown": 60.0
+  },
 
   "universe": {
     "enabled": true,
     "max_symbols": 50,
     "min_price": 5.0,
     "max_price": 500.0,
-    "min_dollar_volume": 20000000,
-    "lookback_days": 3
-  },
-
-  "data": {
-    "quote_source": "yfinance",
-    "max_workers": 8
-  },
-
-  "risk": {
-    "max_notional_per_order": 1000.0,
-    "max_cash_utilization": 0.1,
-    "allow_short_selling": false
+    "min_dollar_volume": 1000000.0,
+    "lookback_days": 1
   },
 
   "strategies": [
@@ -29,17 +34,37 @@
       "type": "micro_market_maker",
       "name": "mm_AAPL",
       "config": {
-        "symbol": "AAPL"
+        "symbol": "AAPL",
+        "max_inventory": 2,
+        "spread": 0.05,
+        "order_quantity": 1,
+        "min_spread": 0.02,
+        "max_spread": 0.2,
+        "vol_window": 50,
+        "vol_to_spread": 2.0
       }
     },
     {
       "type": "micro_trend_scalper",
       "name": "trend_AAPL",
       "config": {
-        "symbol": "AAPL"
+        "symbol": "AAPL",
+        "order_quantity": 1,
+        "short_window": 5,
+        "long_window": 20,
+        "trend_threshold": 0.0005,
+        "max_position": 5,
+        "trailing_stop_pct": 0.01,
+        "take_profit_pct": 0.02
       }
     }
   ],
+
+  "ai": {
+    "enabled": true,
+    "model": "gpt-5-mini",
+    "interval_loops": 60
+  },
 
   "symbol_selector": {
     "enabled": true,
@@ -47,12 +72,5 @@
     "min_trades": 3,
     "mode": "hybrid",
     "model": "gpt-5-mini"
-  },
-
-  "ai": {
-    "enabled": true,
-    "model": "gpt-5-mini",
-    "interval_loops": 12,
-    "temperature": 0.2
   }
 }

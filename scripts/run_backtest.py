@@ -3,332 +3,116 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-from HFTA.broker.client import Quote
-from HFTA.core.risk_manager import RiskConfig
 from HFTA.logging_utils import setup_logging, parse_log_level
-from HFTA.sim.backtester import BacktestConfig, BacktestEngine
-from HFTA.strategies.base import Strategy
-from HFTA.strategies.micro_market_maker import MicroMarketMaker
-from HFTA.strategies.micro_trend_scalper import MicroTrendScalper
+from HFTA.sim.backtester import BacktestConfig, BacktestEngine, load_quotes_from_csv, generate_random_walk_quotes
+from HFTA.config_loader import load_config
+
+logger = logging.getLogger(__name__)
 
 
-STRATEGY_REGISTRY = {
-    "micro_market_maker": MicroMarketMaker,
-    "micro_trend_scalper": MicroTrendScalper,
-}
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def load_json(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def build_risk_config(cfg: dict) -> RiskConfig:
-    risk = cfg.get("risk", {})
-    return RiskConfig(
-        max_notional_per_order=risk.get("max_notional_per_order", 100.0),
-        max_cash_utilization=risk.get("max_cash_utilization", 0.1),
-        allow_short_selling=risk.get("allow_short_selling", False),
-    )
-
-
-def build_strategies(cfg: dict, logger) -> List[Strategy]:
-    """
-    Expected config shape:
-
-    "strategies": [
-      {
-        "type": "micro_market_maker",
-        "name": "mm_AAPL",
-        "config": { ... }
-      },
-      ...
-    ]
-    """
-    strategies_cfg = cfg.get("strategies", [])
-    strategies: List[Strategy] = []
-    for strat_cfg in strategies_cfg:
-        type_key = strat_cfg["type"]
-        name = strat_cfg["name"]
-        strat_cls = STRATEGY_REGISTRY[type_key]
-        strat_config = strat_cfg.get("config", {})
-        logger.debug(
-            "Building strategy '%s' of type '%s' with config=%s",
-            name,
-            type_key,
-            strat_config,
-        )
-        strategies.append(strat_cls(name=name, config=strat_config))
-    return strategies
-
-
-def export_equity_csv(path: Path, result, logger) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "equity"])
-        for ts, eq in zip(result.timestamps, result.equity_curve):
-            ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-            writer.writerow([ts_str, f"{eq:.4f}"])
-    logger.debug("Equity CSV wrote %d rows to %s", len(result.equity_curve), path)
-
-
-def export_fills_csv(path: Path, engine: BacktestEngine, logger) -> None:
-    fills = list(engine.tracker.fills)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["symbol", "side", "quantity", "price", "timestamp"])
-        for fl in fills:
-            writer.writerow(
-                [
-                    fl.symbol,
-                    fl.side,
-                    f"{fl.quantity:.4f}",
-                    f"{fl.price:.4f}",
-                    fl.timestamp or "",
-                ]
-            )
-    logger.debug("Fills CSV wrote %d fills to %s", len(fills), path)
-
-
-def _maybe_float(row: dict, key: str) -> Optional[float]:
-    val = row.get(key)
-    if val is None:
-        return None
-    val = val.strip()
-    if not val:
-        return None
-    try:
-        return float(val)
-    except ValueError:
-        return None
-
-
-def load_quotes_from_csv(path: str, symbol: str, logger) -> List[Quote]:
-    """
-    Load historical quotes from a CSV file.
-
-    Expected columns (header names):
-
-        timestamp,bid,ask,last[,bid_size,ask_size]
-
-    Any missing numeric cell is interpreted as None. If bid/ask are
-    missing but we have a last price, we synthesise a tight spread
-    around last so spread-based strategies can run.
-    """
-    quotes: List[Quote] = []
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ts = row.get("timestamp") or row.get("time") or row.get("datetime")
-
-            bid = _maybe_float(row, "bid")
-            ask = _maybe_float(row, "ask")
-            last = (
-                _maybe_float(row, "last")
-                or _maybe_float(row, "close")
-                or _maybe_float(row, "price")
-            )
-            bid_size = _maybe_float(row, "bid_size")
-            ask_size = _maybe_float(row, "ask_size")
-
-            # If we have neither last nor a full bid/ask, skip this row.
-            if last is None and (bid is None or ask is None):
-                continue
-
-            # If last is missing but both bid and ask exist, infer last as mid.
-            if last is None and bid is not None and ask is not None:
-                last = (bid + ask) / 2.0
-
-            # If bid/ask are missing but we do have a last price,
-            # create a synthetic spread around last.
-            if last is not None and (bid is None or ask is None):
-                half_spread = 0.01  # 1 cent each side
-                bid = last - half_spread
-                ask = last + half_spread
-
-            quotes.append(
-                Quote(
-                    symbol=symbol.upper(),
-                    security_id=f"HIST-{symbol.upper()}",
-                    bid=bid,
-                    ask=ask,
-                    last=last,
-                    bid_size=bid_size,
-                    ask_size=ask_size,
-                    timestamp=ts,
-                )
-            )
-    logger.debug("Loaded %d quotes from %s", len(quotes), path)
-    return quotes
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run HFTA strategies in offline backtest mode."
-    )
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="Run HFTA backtest.")
     parser.add_argument(
         "--config",
         default="configs/paper_aapl.json",
-        help="Path to JSON config file (default: configs/paper_aapl.json)",
+        help="Path to JSON config file.",
     )
     parser.add_argument(
         "--steps",
         type=int,
         default=2000,
-        help=(
-            "Number of synthetic quote steps to simulate (default: 2000). "
-            "Ignored if --quotes-csv is provided."
-        ),
+        help="Number of synthetic steps when not using --quotes-csv.",
     )
     parser.add_argument(
         "--quotes-csv",
-        type=str,
         default=None,
-        help=(
-            "Optional path to CSV of historical quotes "
-            "(timestamp,bid,ask,last[,bid_size,ask_size]). "
-            "If provided, these quotes are used instead of synthetic random walk."
-        ),
+        help="Optional CSV of historical quotes to backtest on.",
     )
     parser.add_argument(
         "--equity-csv",
-        type=str,
         default=None,
         help="Optional path to write equity curve CSV.",
     )
     parser.add_argument(
         "--fills-csv",
-        type=str,
         default=None,
-        help="Optional path to write fill blotter CSV.",
+        help="Optional path to write fills CSV.",
     )
     parser.add_argument(
         "--log-file",
-        type=str,
         default="logs/backtest.log",
-        help="Path to log file (default: logs/backtest.log).",
+        help="Path to log file.",
     )
     parser.add_argument(
         "--log-level",
-        type=str,
         default="DEBUG",
-        help="Logging level: DEBUG, INFO, WARNING, ERROR (default: DEBUG).",
+        help="Log level (DEBUG, INFO, WARNING, ERROR).",
     )
+    args = parser.parse_args(argv)
 
-    args = parser.parse_args()
+    log_level = parse_log_level(args.log_level)
+    setup_logging("HFTA.backtest", args.log_file, level=log_level)
+    logging.getLogger("peewee").setLevel(logging.WARNING)
 
-    level = parse_log_level(args.log_level)
-    logger = setup_logging("HFTA.backtest", args.log_file, level)
-    logger.debug("Parsed arguments: %s", vars(args))
+    logger.info("Starting backtest with config=%s", args.config)
 
-    cfg_json = load_json(args.config)
-    logger.info("Loaded config from %s", args.config)
-    logger.debug("Config JSON: %s", cfg_json)
+    loaded = load_config(args.config)
 
-    risk_cfg = build_risk_config(cfg_json)
-    strategies = build_strategies(cfg_json, logger)
-    logger.info("Built %d strategy instance(s)", len(strategies))
-
-    symbols = cfg_json.get("symbols") or ["AAPL"]
-    symbol = symbols[0].upper()
-
-    paper_cash = float(cfg_json.get("paper_cash", 100_000.0))
-    poll_interval = int(cfg_json.get("poll_interval", 5))
-    starting_price = float(cfg_json.get("starting_price", 40.0))
-    volatility_annual = float(cfg_json.get("volatility_annual", 0.4))
-    spread_cents = float(cfg_json.get("spread_cents", 0.10))
-
-    bt_cfg = BacktestConfig(
-        symbol=symbol,
-        starting_price=starting_price,
-        starting_cash=paper_cash,
+    # Build BacktestConfig
+    backtest_cfg = BacktestConfig(
+        symbol=loaded.symbols[0],
+        starting_cash=loaded.paper_cash,
+        risk_config=loaded.risk_config,
         steps=args.steps,
-        step_seconds=poll_interval,
-        volatility_annual=volatility_annual,
-        spread_cents=spread_cents,
-        risk_config=risk_cfg,
+        step_seconds=loaded.poll_interval,
     )
-    logger.debug("BacktestConfig: %s", bt_cfg)
 
-    quotes: Optional[List[Quote]] = None
+    # Quotes
     if args.quotes_csv:
-        logger.info("Loading quotes from CSV: %s", args.quotes_csv)
-        quotes = load_quotes_from_csv(args.quotes_csv, symbol=symbol, logger=logger)
+        quotes = load_quotes_from_csv(Path(args.quotes_csv))
+        logger.info("Loaded %d quotes from %s", len(quotes), args.quotes_csv)
     else:
-        logger.info("No quotes CSV provided; using synthetic random walk.")
-
-    engine = BacktestEngine(strategies=strategies, config=bt_cfg, quotes=quotes)
-    logger.info("Starting backtest...")
-    result = engine.run()
-    logger.info(
-        "Backtest done. Realized PnL=%.2f, trades=%d",
-        result.realized_pnl,
-        result.num_trades,
-    )
-
-    # ------------------------------------------------------------------ #
-    # Console summary
-    # ------------------------------------------------------------------ #
-
-    print("=== BACKTEST SUMMARY ===")
-    print(f"Symbol: {result.symbol}")
-    print(f"Starting cash: {result.starting_cash:,.2f}")
-    print(f"Final cash: {result.final_cash:,.2f}")
-    print(f"Final equity: {result.final_equity:,.2f}")
-    print(f"Realized PnL: {result.realized_pnl:,.2f}")
-    print(f"Max drawdown: {result.max_drawdown:.2%}")
-    print(f"Steps simulated: {len(result.equity_curve)}")
-
-    print()
-    print("Trade stats:")
-    print(f"  Trades: {result.num_trades}")
-    print(f"  Wins:   {result.num_winning_trades}")
-    print(f"  Losses: {result.num_losing_trades}")
-    print(f"  Best trade PnL:  {result.best_trade_pnl:,.2f}")
-    print(f"  Worst trade PnL: {result.worst_trade_pnl:,.2f}")
-    print(f"  Avg trade PnL:   {result.avg_trade_pnl:,.2f}")
-    print(f"  Sharpe-like (per-step): {result.sharpe_like:.3f}")
-
-    print()
-    print("Open positions at end:")
-    for sym, pos in result.positions_summary.items():
-        print(
-            f"  {sym}: qty={pos.quantity:.2f}, "
-            f"avg_price={pos.avg_price:.2f}, "
-            f"realized_pnl={pos.realized_pnl:.2f}"
+        quotes = generate_random_walk_quotes(
+            symbol=backtest_cfg.symbol,
+            starting_price=loaded.raw.get("starting_price", 150.0),
+            steps=args.steps,
+            step_seconds=backtest_cfg.step_seconds,
+            volatility_annual=loaded.raw.get("volatility_annual", 0.2),
+            spread_cents=loaded.raw.get("spread_cents", 1.0),
+        )
+        logger.info(
+            "Generated %d synthetic quotes for symbol=%s",
+            len(quotes),
+            backtest_cfg.symbol,
         )
 
-    # ------------------------------------------------------------------ #
-    # Optional CSV exports
-    # ------------------------------------------------------------------ #
+    engine = BacktestEngine(
+        strategies=loaded.strategies,
+        config=backtest_cfg,
+        quotes=quotes,
+    )
+
+    result = engine.run()
+
+    logger.info(
+        "BACKTEST SUMMARY: starting_cash=%.2f final_equity=%.2f realized_pnl=%.2f max_drawdown=%.2f",
+        result.starting_cash,
+        result.final_equity,
+        result.realized_pnl,
+        result.max_drawdown,
+    )
 
     if args.equity_csv:
-        export_equity_csv(Path(args.equity_csv), result, logger)
-        logger.info("Equity curve written to %s", args.equity_csv)
-        print(f"\nEquity curve written to {args.equity_csv}")
+        result.write_equity_csv(Path(args.equity_csv))
+        logger.info("Wrote equity curve to %s", args.equity_csv)
 
     if args.fills_csv:
-        export_fills_csv(Path(args.fills_csv), engine, logger)
-        logger.info("Fills blotter written to %s", args.fills_csv)
-        print(f"Fills blotter written to {args.fills_csv}")
+        result.write_fills_csv(Path(args.fills_csv))
+        logger.info("Wrote fills blotter to %s", args.fills_csv)
 
 
 if __name__ == "__main__":
