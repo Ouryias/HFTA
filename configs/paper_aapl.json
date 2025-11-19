@@ -1,7 +1,7 @@
 {
   "symbols": ["AAPL"],
   "paper_cash": 100000,
-  "poll_interval": 5,
+  "poll_interval": 0.25,
 
   "risk": {
     "max_notional_per_order": 200.0,
@@ -61,7 +61,7 @@
   "ai": {
     "enabled": true,
     "model": "gpt-5-mini",
-    "interval_loops": 60
+    "interval_loops": 12
   },
 
   "symbol_selector": {
